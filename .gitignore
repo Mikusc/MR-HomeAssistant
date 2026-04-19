@@ -10,6 +10,7 @@ UserSettings/
 # Visual Studio / Rider / IDE files
 .vs/
 .idea/
+.vscode/
 *.csproj
 *.sln
 *.slnx
