@@ -1,0 +1,34 @@
+# Unity generated folders
+Library/
+Temp/
+Obj/
+Build/
+Builds/
+Logs/
+UserSettings/
+
+# Visual Studio / Rider / IDE files
+.vs/
+.idea/
+*.csproj
+*.sln
+*.slnx
+*.user
+*.unityproj
+*.pidb
+*.booproj
+*.svd
+*.tmp
+*.pdb
+*.mdb
+*.opendb
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Packages and caches
+*.log
+*.apk
+*.aab
+TempAssembly.dll
