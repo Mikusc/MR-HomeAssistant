@@ -29,7 +29,13 @@ namespace MRHomeAssistant.Runtime.Infrastructure.Persistence
         public void Save(AppSettingsData data)
         {
             Directory.CreateDirectory(UnityEngine.Application.persistentDataPath);
-            string json = JsonUtility.ToJson(data, true);
+            // Read legacy tokens for compatibility, but never persist credentials.
+            var publicSettings = new AppSettingsData
+            {
+                homeAssistantUrl = data.homeAssistantUrl,
+                onboardingCompleted = data.onboardingCompleted
+            };
+            string json = JsonUtility.ToJson(publicSettings, true);
             File.WriteAllText(filePath, json);
         }
 

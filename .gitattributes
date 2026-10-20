@@ -40,6 +40,7 @@
 *.tif binary
 *.tiff binary
 *.ttf binary
+*.otf binary
 *.wav binary
 *.woff binary
 *.woff2 binary

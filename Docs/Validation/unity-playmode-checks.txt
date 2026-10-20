@@ -1,0 +1,3 @@
+92 Play Mode assertions passed at 2026-09-22T12:41:55.3329620Z
+Bootstrap scene; synthetic Input System mouse and TMP text events; demo devices.
+Native JsonUtility and WebSocket checks against loopback mock. No physical devices.

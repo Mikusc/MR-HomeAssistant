@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
@@ -10,668 +12,531 @@ using UnityEngine;
 
 namespace MRHomeAssistant.Runtime.Application.HomeAssistant
 {
-    /// <summary>
-    /// Phase 1 Home Assistant connector:
-    /// - reads config
-    /// - connects to /api/websocket
-    /// - authenticates
-    /// - loads initial get_states snapshot
-    /// - subscribes to state_changed events
-    /// </summary>
     [DisallowMultipleComponent]
     public sealed class HomeAssistantConnection : MonoBehaviour
     {
-        [Header("Debug")]
-        [SerializeField]
-        private bool logOnStart = true;
-
-        [SerializeField]
-        private bool autoEvaluateConfigurationOnStart = true;
-
-        [SerializeField]
-        private bool autoConnectOnStart = true;
-
-        [SerializeField]
-        private bool logRawMessages = false;
-
-        [Header("Timeouts")]
-        [SerializeField]
-        private int connectTimeoutSeconds = 10;
-
-        [SerializeField]
-        private int logStatePreviewCount = 8;
+        [SerializeField] private bool autoEvaluateConfigurationOnStart = true;
+        [SerializeField] private bool autoConnectOnStart = true;
+        [SerializeField] private int connectTimeoutSeconds = 10;
+        [SerializeField] private int reconnectDelaySeconds = 2;
+        [SerializeField] private int heartbeatSeconds = 15;
 
         public event Action<IReadOnlyList<HomeAssistantStateSummary>> StatesChanged;
         public event Action<HomeAssistantStateSummary> StateUpdated;
         public event Action ConnectionStateChanged;
-
         public bool HasValidConfiguration { get; private set; }
         public bool IsConnected { get; private set; }
         public bool IsAuthenticated { get; private set; }
-        public string CurrentUrl { get; private set; } = string.Empty;
-        public string CurrentToken { get; private set; } = string.Empty;
-        public string CurrentWebSocketUrl { get; private set; } = string.Empty;
-        public string LastError { get; private set; } = string.Empty;
-        public HomeAssistantConnectionPhase ConnectionPhase { get; private set; } = HomeAssistantConnectionPhase.Disconnected;
-        public IReadOnlyList<HomeAssistantStateSummary> States => _states;
+        public bool IsDemo { get; private set; }
+        public bool IsBusy => ConnectionPhase == HomeAssistantConnectionPhase.Connecting || ConnectionPhase == HomeAssistantConnectionPhase.Reconnecting;
+        public bool IsStale => !IsConnected && !IsDemo && states.Count > 0;
+        public int ReconnectAttempt { get; private set; }
+        public DateTime? NextReconnectAt { get; private set; }
+        public DateTime? LastContactUtc { get; private set; }
+        public string MetadataStatus { get; private set; } = "";
+        public string LastActionStatus { get; private set; } = "";
+        public long LastActionMilliseconds { get; private set; }
+        public HomeAssistantCatalog Catalog { get; } = new();
+        public string CurrentUrl { get; private set; } = "";
+        public string CurrentWebSocketUrl { get; private set; } = "";
+        public string LastError { get; private set; } = "";
+        public DateTime? LastStateUpdate { get; private set; }
+        public HomeAssistantConnectionPhase ConnectionPhase { get; private set; }
+        public IReadOnlyList<HomeAssistantStateSummary> States => states;
 
-        private readonly List<HomeAssistantStateSummary> _states = new();
-
-        private AppSettingsRepository _appSettingsRepository;
-        private ClientWebSocket _webSocket;
-        private CancellationTokenSource _lifetimeCancellation;
-        private Task _receiveLoopTask;
-        private int _nextMessageId = 1;
-        private int _stateChangedSubscriptionId = -1;
-
-        private void Awake()
-        {
-            _appSettingsRepository = new AppSettingsRepository();
-            _lifetimeCancellation = new CancellationTokenSource();
-        }
+        private readonly List<HomeAssistantStateSummary> states = new();
+        private readonly Dictionary<int, TaskCompletionSource<string>> requests = new();
+        private readonly HashSet<string> pendingEntities = new();
+        private readonly List<string> initialEvents = new();
+        private readonly SemaphoreSlim sendLock = new(1, 1);
+        private ClientWebSocket socket;
+        private CancellationTokenSource session;
+        private string token = "";
+        private int nextId;
+        private int subscriptionId;
+        private bool initializing;
+        private CancellationTokenSource recovery;
+        private bool wantsConnection;
+        private bool suspended;
+        private int connectionGeneration;
 
         private async void Start()
         {
-            if (autoEvaluateConfigurationOnStart)
-            {
-                EvaluateConfiguration();
-            }
-
-            if (autoConnectOnStart && HasValidConfiguration)
-            {
-                await ConnectAndInitializeAsync();
-            }
+            if (IsDemo || IsBusy || IsConnected) return;
+            if (autoEvaluateConfigurationOnStart) EvaluateConfiguration();
+            if (autoConnectOnStart && HasValidConfiguration) await ConnectAndInitializeAsync();
         }
 
-        private void OnDestroy()
-        {
-            try
-            {
-                _lifetimeCancellation?.Cancel();
-                _lifetimeCancellation?.Dispose();
-                _lifetimeCancellation = null;
-            }
-            catch
-            {
-                // ignored
-            }
+        private void OnDestroy() => Disconnect();
 
-            DisposeSocketIfAny();
-        }
-
-        [ContextMenu("Evaluate Home Assistant Configuration")]
         public void EvaluateConfiguration()
         {
-            HasValidConfiguration = false;
-            IsConnected = false;
-            IsAuthenticated = false;
-            LastError = string.Empty;
-            CurrentUrl = string.Empty;
-            CurrentToken = string.Empty;
-            CurrentWebSocketUrl = string.Empty;
-            _stateChangedSubscriptionId = -1;
-
-            if (!_appSettingsRepository.TryLoad(out AppSettingsData settings))
+            if (IsBusy || IsConnected || IsDemo || HasValidConfiguration) return;
+            if (new AppSettingsRepository().TryLoad(out AppSettingsData settings))
             {
-                if (logOnStart)
-                {
-                    Debug.LogWarning(
-                        $"[HomeAssistantConnection] app-settings.json could not be loaded | Path={_appSettingsRepository.FilePath}",
-                        this);
-                }
-
-                SetConnectionPhase(HomeAssistantConnectionPhase.Disconnected);
-                NotifyConnectionStateChanged();
-                return;
+                CurrentUrl = settings.homeAssistantUrl ?? "";
+                // Existing local installations may have a legacy token. Never write it back.
+                if (string.IsNullOrWhiteSpace(token)) token = settings.homeAssistantToken ?? "";
             }
+            HasValidConfiguration = TryBuildWebSocketUrl(CurrentUrl, out string url) && !string.IsNullOrWhiteSpace(token);
+            CurrentWebSocketUrl = url;
+            ConnectionStateChanged?.Invoke();
+        }
 
-            CurrentUrl = settings.homeAssistantUrl?.Trim() ?? string.Empty;
-            CurrentToken = settings.homeAssistantToken?.Trim() ?? string.Empty;
-
-            bool hasUrl = !string.IsNullOrWhiteSpace(CurrentUrl);
-            bool hasToken = !string.IsNullOrWhiteSpace(CurrentToken);
-
-            HasValidConfiguration = hasUrl && hasToken;
-
-            if (HasValidConfiguration)
+        public bool Configure(string url, string accessToken, out string error)
+        {
+            error = "";
+            if (IsBusy) { error = "Cancel the current connection first."; return false; }
+            if (!TryBuildWebSocketUrl(url, out string websocketUrl))
             {
-                CurrentWebSocketUrl = BuildWebSocketUrl(CurrentUrl);
+                error = "Enter a valid http:// or https:// server address.";
+                return false;
             }
-
-            if (logOnStart)
+            if (string.IsNullOrWhiteSpace(accessToken))
             {
-                if (HasValidConfiguration)
-                {
-                    Debug.Log(
-                        $"[HomeAssistantConnection] Configuration ready | Url={CurrentUrl} | WsUrl={CurrentWebSocketUrl} | Token=set ({CurrentToken.Length} chars)",
-                        this);
-                }
-                else
-                {
-                    Debug.LogWarning(
-                        $"[HomeAssistantConnection] Configuration incomplete | Url={(hasUrl ? CurrentUrl : "<empty>")} | Token={(hasToken ? $"set ({CurrentToken.Length} chars)" : "<empty>")}",
-                        this);
-                }
+                error = "Enter a Home Assistant access token.";
+                return false;
             }
+            Disconnect();
+            CurrentUrl = url.Trim();
+            CurrentWebSocketUrl = websocketUrl;
+            token = accessToken.Trim();
+            HasValidConfiguration = true;
+            LastError = "";
+            ConnectionStateChanged?.Invoke();
+            return true;
+        }
 
-            SetConnectionPhase(HomeAssistantConnectionPhase.Disconnected);
-            NotifyConnectionStateChanged();
+        public static bool TryBuildWebSocketUrl(string value, out string websocketUrl)
+        {
+            websocketUrl = "";
+            if (string.IsNullOrWhiteSpace(value)) return false;
+            string candidate = value.Trim();
+            if (!candidate.Contains("://")) candidate = "http://" + candidate;
+            if (!Uri.TryCreate(candidate, UriKind.Absolute, out Uri uri) || string.IsNullOrWhiteSpace(uri.Host) ||
+                !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment)) return false;
+            if (uri.Scheme != "http" && uri.Scheme != "https" && uri.Scheme != "ws" && uri.Scheme != "wss") return false;
+            var builder = new UriBuilder(uri) { Scheme = uri.Scheme == "https" || uri.Scheme == "wss" ? "wss" : "ws" };
+            string path = uri.AbsolutePath.TrimEnd('/');
+            builder.Path = path.EndsWith("/api/websocket", StringComparison.Ordinal) ? path : path + "/api/websocket";
+            websocketUrl = builder.Uri.AbsoluteUri;
+            return true;
         }
 
         [ContextMenu("Connect Home Assistant")]
         public async void ConnectFromContextMenu()
         {
-            if (!HasValidConfiguration)
-            {
-                EvaluateConfiguration();
-            }
-
-            if (HasValidConfiguration)
-            {
-                await ConnectAndInitializeAsync();
-            }
+            EvaluateConfiguration();
+            await ConnectAndInitializeAsync();
         }
 
         public async Task ConnectAndInitializeAsync()
         {
-            if (!HasValidConfiguration)
-            {
-                Debug.LogWarning("[HomeAssistantConnection] Connect skipped: configuration is incomplete.", this);
-                return;
-            }
+            if (IsBusy || !HasValidConfiguration) return;
+            Disconnect();
+            int generation = connectionGeneration;
+            wantsConnection = true;
+            await AttemptConnectionAsync();
+            if (generation == connectionGeneration && wantsConnection && !IsConnected) ScheduleRecovery();
+        }
 
-            LastError = string.Empty;
-            IsConnected = false;
-            IsAuthenticated = false;
-            _stateChangedSubscriptionId = -1;
-            _nextMessageId = 1;
-            _states.Clear();
-            DisposeSocketIfAny();
-
-            SetConnectionPhase(HomeAssistantConnectionPhase.Connecting);
-            NotifyConnectionStateChanged();
-
-            _webSocket = new ClientWebSocket();
-
-            using CancellationTokenSource timeoutCancellation =
-                new CancellationTokenSource(TimeSpan.FromSeconds(connectTimeoutSeconds));
-            using CancellationTokenSource linkedCancellation =
-                CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token, timeoutCancellation.Token);
-
-            CancellationToken cancellationToken = linkedCancellation.Token;
-
+        private async Task AttemptConnectionAsync()
+        {
+            CloseTransport(true);
+            var lifetime = new CancellationTokenSource();
+            session = lifetime;
+            var client = new ClientWebSocket();
+            socket = client;
+            LastError = "";
+            ConnectionPhase = ReconnectAttempt > 0 ? HomeAssistantConnectionPhase.Reconnecting : HomeAssistantConnectionPhase.Connecting;
+            ConnectionStateChanged?.Invoke();
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, connectTimeoutSeconds)));
             try
             {
-                Debug.Log($"[HomeAssistantConnection] Connecting | {CurrentWebSocketUrl}", this);
-                await _webSocket.ConnectAsync(new Uri(CurrentWebSocketUrl), cancellationToken);
-
-                string authRequiredJson = await ReceiveTextMessageAsync(_webSocket, cancellationToken);
-                LogRaw("RECV", authRequiredJson);
-
-                HomeAssistantMessageEnvelope authRequired =
-                    JsonUtility.FromJson<HomeAssistantMessageEnvelope>(authRequiredJson);
-
-                if (authRequired == null || authRequired.type != "auth_required")
-                {
-                    throw new InvalidOperationException($"Expected auth_required, got: {authRequiredJson}");
-                }
-
-                HomeAssistantAuthRequest authRequest = new HomeAssistantAuthRequest
-                {
-                    access_token = CurrentToken
-                };
-
-                string authRequestJson = JsonUtility.ToJson(authRequest);
-                LogRaw("SEND", authRequestJson);
-                await SendTextMessageAsync(_webSocket, authRequestJson, cancellationToken);
-
-                string authResponseJson = await ReceiveTextMessageAsync(_webSocket, cancellationToken);
-                LogRaw("RECV", authResponseJson);
-
-                HomeAssistantMessageEnvelope authResponse =
-                    JsonUtility.FromJson<HomeAssistantMessageEnvelope>(authResponseJson);
-
-                if (authResponse == null)
-                {
-                    throw new InvalidOperationException("Auth response could not be parsed.");
-                }
-
-                if (authResponse.type == "auth_invalid")
-                {
-                    throw new InvalidOperationException(
-                        string.IsNullOrWhiteSpace(authResponse.message)
-                            ? "Home Assistant rejected the token."
-                            : authResponse.message);
-                }
-
-                if (authResponse.type != "auth_ok")
-                {
-                    throw new InvalidOperationException($"Unexpected auth response type: {authResponse.type}");
-                }
-
+                await client.ConnectAsync(new Uri(CurrentWebSocketUrl), timeout.Token);
+                var challenge = JsonUtility.FromJson<HomeAssistantMessageEnvelope>(await ReceiveAsync(client, timeout.Token));
+                if (challenge?.type != "auth_required") throw new InvalidOperationException("Unexpected server handshake.");
+                await SendAsync(client, JsonUtility.ToJson(new HomeAssistantAuthRequest { access_token = token }), timeout.Token);
+                var auth = JsonUtility.FromJson<HomeAssistantMessageEnvelope>(await ReceiveAsync(client, timeout.Token));
+                if (session != lifetime) return;
+                if (auth?.type != "auth_ok") throw new UnauthorizedAccessException();
                 IsAuthenticated = true;
+                LastContactUtc = DateTime.UtcNow;
+                initializing = true;
+                _ = ReceiveLoopAsync(client, lifetime);
+
+                // Subscribe first and replay events after the snapshot to retain changes during loading.
+                subscriptionId = ++nextId;
+                await RequestAsync(client, new HomeAssistantSubscribeEventsRequest { id = subscriptionId }, subscriptionId, timeout.Token);
+                int id = ++nextId;
+                string snapshot = await RequestAsync(client, new HomeAssistantGetStatesRequest { id = id }, id, timeout.Token);
+                if (session != lifetime) return;
+                var response = JsonUtility.FromJson<HomeAssistantGetStatesResponse>(snapshot);
+                states.Clear();
+                if (response.result != null) states.AddRange(response.result);
+                initializing = false;
+                foreach (string json in initialEvents) ApplyEvent(json);
+                initialEvents.Clear();
+                if (session != lifetime) return;
                 IsConnected = true;
-
-                Debug.Log(
-                    $"[HomeAssistantConnection] Authenticated successfully | ha_version={Safe(authResponse.ha_version)}",
-                    this);
-
-                await LoadInitialStatesAsync(cancellationToken);
-                await SubscribeToStateChangedEventsAsync(cancellationToken);
-
-                _receiveLoopTask = ReceiveLoopAsync(_lifetimeCancellation.Token);
-
-                SetConnectionPhase(HomeAssistantConnectionPhase.Connected);
-                NotifyConnectionStateChanged();
-
-                Debug.Log(
-                    $"[HomeAssistantConnection] Initial snapshot loaded | Count={_states.Count} | {BuildPreview()}",
-                    this);
-            }
-            catch (OperationCanceledException)
-            {
-                LastError = $"Connection/auth timed out after {connectTimeoutSeconds} seconds.";
-                Debug.LogError($"[HomeAssistantConnection] {LastError}", this);
-
-                IsConnected = false;
-                IsAuthenticated = false;
-                SetConnectionPhase(HomeAssistantConnectionPhase.Disconnected);
-                NotifyConnectionStateChanged();
-                DisposeSocketIfAny();
+                ConnectionPhase = HomeAssistantConnectionPhase.Connected;
+                NextReconnectAt = null;
+                NotifyStates();
+                ConnectionStateChanged?.Invoke();
+                _ = LoadCatalogAsync(client, lifetime);
+                _ = HeartbeatAsync(client, lifetime);
             }
             catch (Exception ex)
             {
-                LastError = $"{ex.GetType().Name}: {ex.Message}";
-                Debug.LogError($"[HomeAssistantConnection] Connection/auth failed | {LastError}", this);
-
-                IsConnected = false;
-                IsAuthenticated = false;
-                SetConnectionPhase(HomeAssistantConnectionPhase.Disconnected);
-                NotifyConnectionStateChanged();
-                DisposeSocketIfAny();
+                if (session != lifetime) return;
+                string message = ex is UnauthorizedAccessException ? "Access token rejected. Check the token and try again." :
+                    ex is OperationCanceledException ? "Connection timed out. Check the address and network, then retry." :
+                    "Could not connect. Check the server address, network and certificate.";
+                CloseTransport(true);
+                if (ex is UnauthorizedAccessException) { wantsConnection = false; HasValidConfiguration = false; }
+                LastError = message;
+                ConnectionStateChanged?.Invoke();
             }
         }
 
-        public bool TryGetCachedState(string entityId, out HomeAssistantStateSummary state)
+        public void Disconnect()
         {
-            state = FindState(entityId);
-            return state != null;
+            connectionGeneration++;
+            wantsConnection = false;
+            CancelRecovery();
+            ReconnectAttempt = 0;
+            NextReconnectAt = null;
+            LastError = "";
+            LastActionStatus = "";
+            CloseTransport(false);
+            NotifyConnection();
         }
 
-        private async Task LoadInitialStatesAsync(CancellationToken cancellationToken)
+        public void ForgetCredentials()
         {
-            HomeAssistantGetStatesRequest request = new HomeAssistantGetStatesRequest
-            {
-                id = GetNextMessageId()
-            };
-
-            string requestJson = JsonUtility.ToJson(request);
-            LogRaw("SEND", requestJson);
-            await SendTextMessageAsync(_webSocket, requestJson, cancellationToken);
-
-            string responseJson = await ReceiveTextMessageAsync(_webSocket, cancellationToken);
-            LogRaw("RECV", responseJson);
-
-            HomeAssistantGetStatesResponse response =
-                JsonUtility.FromJson<HomeAssistantGetStatesResponse>(responseJson);
-
-            if (response == null)
-            {
-                throw new InvalidOperationException("get_states response could not be parsed.");
-            }
-
-            if (!response.success)
-            {
-                throw new InvalidOperationException("Home Assistant get_states request failed.");
-            }
-
-            _states.Clear();
-            if (response.result != null)
-            {
-                _states.AddRange(response.result);
-            }
-
-            NotifyStatesChanged();
-        }
-
-        private async Task SubscribeToStateChangedEventsAsync(CancellationToken cancellationToken)
-        {
-            HomeAssistantSubscribeEventsRequest request = new HomeAssistantSubscribeEventsRequest
-            {
-                id = GetNextMessageId(),
-                event_type = "state_changed"
-            };
-
-            string requestJson = JsonUtility.ToJson(request);
-            LogRaw("SEND", requestJson);
-            await SendTextMessageAsync(_webSocket, requestJson, cancellationToken);
-
-            string responseJson = await ReceiveTextMessageAsync(_webSocket, cancellationToken);
-            LogRaw("RECV", responseJson);
-
-            HomeAssistantMessageEnvelope response =
-                JsonUtility.FromJson<HomeAssistantMessageEnvelope>(responseJson);
-
-            if (response == null)
-            {
-                throw new InvalidOperationException("subscribe_events response could not be parsed.");
-            }
-
-            if (!response.success)
-            {
-                throw new InvalidOperationException(
-                    string.IsNullOrWhiteSpace(response.message)
-                        ? "Home Assistant rejected the state_changed subscription."
-                        : response.message);
-            }
-
-            _stateChangedSubscriptionId = request.id;
-
-            Debug.Log("[HomeAssistantConnection] Subscribed to state_changed events.", this);
-        }
-
-        private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
-        {
-            try
-            {
-                while (!cancellationToken.IsCancellationRequested &&
-                       _webSocket != null &&
-                       _webSocket.State == WebSocketState.Open)
-                {
-                    string json = await ReceiveTextMessageAsync(_webSocket, cancellationToken);
-                    LogRaw("RECV", json);
-                    DispatchInboundMessage(json);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Play mode exit / object destroy
-            }
-            catch (Exception ex)
-            {
-                if (_lifetimeCancellation == null || _lifetimeCancellation.IsCancellationRequested)
-                {
-                    return;
-                }
-
-                LastError = $"Receive loop failed | {ex.GetType().Name}: {ex.Message}";
-                Debug.LogWarning($"[HomeAssistantConnection] {LastError}", this);
-
-                IsConnected = false;
-                IsAuthenticated = false;
-                SetConnectionPhase(HomeAssistantConnectionPhase.Disconnected);
-                NotifyConnectionStateChanged();
-            }
-        }
-
-        private void DispatchInboundMessage(string json)
-        {
-            if (string.IsNullOrWhiteSpace(json))
-            {
-                return;
-            }
-
-            HomeAssistantMessageEnvelope envelope =
-                JsonUtility.FromJson<HomeAssistantMessageEnvelope>(json);
-
-            if (envelope == null)
-            {
-                return;
-            }
-
-            if (envelope.type == "event")
-            {
-                HandleEventMessage(json);
-            }
-        }
-
-        private void HandleEventMessage(string json)
-        {
-            HomeAssistantEventEnvelope eventEnvelope =
-                JsonUtility.FromJson<HomeAssistantEventEnvelope>(json);
-
-            if (eventEnvelope == null)
-            {
-                return;
-            }
-
-            if (eventEnvelope.id != _stateChangedSubscriptionId)
-            {
-                return;
-            }
-
-            if (eventEnvelope.@event == null ||
-                !string.Equals(eventEnvelope.@event.event_type, "state_changed", StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            HomeAssistantStateChangedData stateChanged = eventEnvelope.@event.data;
-            if (stateChanged == null || string.IsNullOrWhiteSpace(stateChanged.entity_id))
-            {
-                return;
-            }
-
-            if (stateChanged.new_state == null)
-            {
-                RemoveState(stateChanged.entity_id);
-
-                Debug.Log(
-                    $"[HomeAssistantConnection] State removed | Entity={stateChanged.entity_id}",
-                    this);
-
-                NotifyStatesChanged();
-                return;
-            }
-
-            if (string.IsNullOrWhiteSpace(stateChanged.new_state.entity_id))
-            {
-                stateChanged.new_state.entity_id = stateChanged.entity_id;
-            }
-
-            UpsertState(stateChanged.new_state);
-            StateUpdated?.Invoke(stateChanged.new_state);
-
-            Debug.Log(
-                $"[HomeAssistantConnection] State updated | Entity={stateChanged.new_state.entity_id} | State={stateChanged.new_state.state}",
-                this);
-
-            NotifyStatesChanged();
-        }
-
-        private HomeAssistantStateSummary FindState(string entityId)
-        {
-            if (string.IsNullOrWhiteSpace(entityId))
-            {
-                return null;
-            }
-
-            for (int i = 0; i < _states.Count; i++)
-            {
-                HomeAssistantStateSummary state = _states[i];
-                if (string.Equals(state.entity_id, entityId, StringComparison.OrdinalIgnoreCase))
-                {
-                    return state;
-                }
-            }
-
-            return null;
-        }
-
-        private void UpsertState(HomeAssistantStateSummary nextState)
-        {
-            if (nextState == null || string.IsNullOrWhiteSpace(nextState.entity_id))
-            {
-                return;
-            }
-
-            for (int i = 0; i < _states.Count; i++)
-            {
-                if (string.Equals(_states[i].entity_id, nextState.entity_id, StringComparison.OrdinalIgnoreCase))
-                {
-                    _states[i] = nextState;
-                    return;
-                }
-            }
-
-            _states.Add(nextState);
-        }
-
-        private void RemoveState(string entityId)
-        {
-            if (string.IsNullOrWhiteSpace(entityId))
-            {
-                return;
-            }
-
-            for (int i = _states.Count - 1; i >= 0; i--)
-            {
-                if (string.Equals(_states[i].entity_id, entityId, StringComparison.OrdinalIgnoreCase))
-                {
-                    _states.RemoveAt(i);
-                    return;
-                }
-            }
-        }
-
-        private async Task SendTextMessageAsync(ClientWebSocket socket, string text, CancellationToken cancellationToken)
-        {
-            byte[] bytes = Encoding.UTF8.GetBytes(text);
-            ArraySegment<byte> segment = new ArraySegment<byte>(bytes);
-            await socket.SendAsync(segment, WebSocketMessageType.Text, true, cancellationToken);
-        }
-
-        private async Task<string> ReceiveTextMessageAsync(ClientWebSocket socket, CancellationToken cancellationToken)
-        {
-            byte[] buffer = new byte[8192];
-            ArraySegment<byte> segment = new ArraySegment<byte>(buffer);
-            StringBuilder builder = new StringBuilder();
-
-            while (true)
-            {
-                WebSocketReceiveResult result = await socket.ReceiveAsync(segment, cancellationToken);
-
-                if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    throw new WebSocketException("Server closed the WebSocket connection.");
-                }
-
-                if (result.Count > 0)
-                {
-                    builder.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
-                }
-
-                if (result.EndOfMessage)
-                {
-                    return builder.ToString();
-                }
-            }
-        }
-
-        private static string BuildWebSocketUrl(string configuredUrl)
-        {
-            string trimmed = configuredUrl.Trim().TrimEnd('/');
-
-            if (trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-            {
-                trimmed = "wss://" + trimmed.Substring("https://".Length);
-            }
-            else if (trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
-            {
-                trimmed = "ws://" + trimmed.Substring("http://".Length);
-            }
-            else if (!trimmed.StartsWith("ws://", StringComparison.OrdinalIgnoreCase) &&
-                     !trimmed.StartsWith("wss://", StringComparison.OrdinalIgnoreCase))
-            {
-                trimmed = "ws://" + trimmed;
-            }
-
-            if (!trimmed.EndsWith("/api/websocket", StringComparison.OrdinalIgnoreCase))
-            {
-                trimmed += "/api/websocket";
-            }
-
-            return trimmed;
-        }
-
-        private void DisposeSocketIfAny()
-        {
-            if (_webSocket == null)
-            {
-                return;
-            }
-
-            try
-            {
-                _webSocket.Dispose();
-            }
-            catch
-            {
-                // ignored
-            }
-
-            _webSocket = null;
-        }
-
-        private void NotifyStatesChanged()
-        {
-            StatesChanged?.Invoke(_states);
-        }
-
-        private void NotifyConnectionStateChanged()
-        {
+            Disconnect();
+            token = "";
+            HasValidConfiguration = false;
             ConnectionStateChanged?.Invoke();
         }
 
-        private void SetConnectionPhase(HomeAssistantConnectionPhase nextPhase)
+        private void CloseTransport(bool retainSnapshot)
         {
-            ConnectionPhase = nextPhase;
+            var old = session;
+            session = null;
+            old?.Cancel();
+            socket?.Dispose();
+            socket = null;
+            foreach (var request in requests.Values) request.TrySetCanceled();
+            requests.Clear();
+            pendingEntities.Clear();
+            initialEvents.Clear();
+            initializing = false;
+            if (!retainSnapshot) { states.Clear(); Catalog.Clear(); MetadataStatus = ""; LastStateUpdate = null; }
+            IsDemo = false;
+            IsConnected = false;
+            IsAuthenticated = false;
+            LastContactUtc = null;
+            ConnectionPhase = HomeAssistantConnectionPhase.Disconnected;
+            old?.Dispose();
         }
 
-        private int GetNextMessageId()
+        private void NotifyConnection() { StatesChanged?.Invoke(states); ConnectionStateChanged?.Invoke(); }
+
+        private void CancelRecovery()
         {
-            return _nextMessageId++;
+            var previous = recovery;
+            recovery = null;
+            previous?.Cancel();
+            previous?.Dispose();
         }
 
-        private void LogRaw(string direction, string text)
+        private void ScheduleRecovery(bool immediate = false)
         {
-            if (!logRawMessages)
-            {
-                return;
-            }
-
-            Debug.Log($"[HomeAssistantConnection] {direction} {text}", this);
+            if (!wantsConnection || suspended || recovery != null || IsConnected || !HasValidConfiguration) return;
+            var lifetime = new CancellationTokenSource();
+            recovery = lifetime;
+            _ = RecoverAsync(lifetime, immediate);
         }
 
-        private string BuildPreview()
+        private async Task RecoverAsync(CancellationTokenSource lifetime, bool immediate)
         {
-            if (_states.Count == 0 || logStatePreviewCount <= 0)
+            CancellationToken ct = lifetime.Token;
+            try
             {
-                return "No states returned.";
-            }
-
-            int previewCount = Mathf.Min(logStatePreviewCount, _states.Count);
-            StringBuilder builder = new StringBuilder("Preview: ");
-
-            for (int i = 0; i < previewCount; i++)
-            {
-                HomeAssistantStateSummary state = _states[i];
-                if (i > 0)
+                for (int attempt = 1; attempt <= 5 && wantsConnection && !suspended; attempt++)
                 {
-                    builder.Append(", ");
+                    ReconnectAttempt = attempt;
+                    int delay = immediate && attempt == 1 ? 0 : Math.Min(30, Math.Max(1, reconnectDelaySeconds) * (1 << (attempt - 1)));
+                    NextReconnectAt = DateTime.UtcNow.AddSeconds(delay);
+                    ConnectionPhase = HomeAssistantConnectionPhase.Reconnecting;
+                    NotifyConnection();
+                    await Task.Delay(TimeSpan.FromSeconds(delay), ct);
+                    if (ct.IsCancellationRequested || !wantsConnection || suspended) return;
+                    await AttemptConnectionAsync();
+                    if (ct.IsCancellationRequested || IsConnected || !wantsConnection) return;
                 }
-
-                builder.Append(state.entity_id);
-                builder.Append('=');
-                builder.Append(state.state);
+                if (!ct.IsCancellationRequested && wantsConnection)
+                {
+                    wantsConnection = false;
+                    ConnectionPhase = HomeAssistantConnectionPhase.Disconnected;
+                    NextReconnectAt = null;
+                    LastError = "Could not restore the connection. Check the network and reconnect.";
+                    NotifyConnection();
+                }
             }
-
-            return builder.ToString();
+            catch (OperationCanceledException) { }
+            finally { if (recovery == lifetime) { recovery = null; lifetime.Dispose(); } }
         }
 
-        private static string Safe(string value)
+        private void ConnectionLost(CancellationTokenSource lifetime)
         {
-            return string.IsNullOrWhiteSpace(value) ? "<empty>" : value;
+            if (session != lifetime) return;
+            CloseTransport(true);
+            LastError = "Connection lost. Cached states are read-only until reconnected.";
+            NotifyConnection();
+            ScheduleRecovery();
+        }
+
+        private void OnApplicationPause(bool paused) => SetApplicationPaused(paused);
+
+        public void SetApplicationPaused(bool paused)
+        {
+            suspended = paused;
+            if (paused && wantsConnection)
+            {
+                CancelRecovery();
+                CloseTransport(true);
+                NextReconnectAt = null;
+                LastError = "Connection paused. States will refresh on resume.";
+                NotifyConnection();
+            }
+            else if (!paused && wantsConnection) ScheduleRecovery(true);
+        }
+
+        private async Task HeartbeatAsync(ClientWebSocket client, CancellationTokenSource lifetime)
+        {
+            CancellationToken ct = lifetime.Token;
+            try
+            {
+                while (session == lifetime && !ct.IsCancellationRequested)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, heartbeatSeconds)), ct);
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(5));
+                    int id = ++nextId;
+                    await RequestAsync(client, new HomeAssistantCommand { id = id, type = "ping" }, id, timeout.Token);
+                }
+            }
+            catch (Exception) { ConnectionLost(lifetime); }
+        }
+
+        private async Task LoadCatalogAsync(ClientWebSocket client, CancellationTokenSource lifetime)
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(6));
+            MetadataStatus = "Loading rooms...";
+            try
+            {
+                var areas = await RegistryAsync<HomeAssistantArea>(client, "config/area_registry/list", timeout.Token);
+                var devices = await RegistryAsync<HomeAssistantDevice>(client, "config/device_registry/list", timeout.Token);
+                var entities = await RegistryAsync<HomeAssistantEntity>(client, "config/entity_registry/list", timeout.Token);
+                if (session != lifetime) return;
+                Catalog.Load(areas, devices, entities);
+                MetadataStatus = "";
+            }
+            catch (Exception)
+            {
+                if (session != lifetime) return;
+                Catalog.Clear();
+                MetadataStatus = "Room metadata unavailable. Showing individual entities.";
+            }
+            StatesChanged?.Invoke(states);
+        }
+
+        private async Task<T[]> RegistryAsync<T>(ClientWebSocket client, string type, CancellationToken ct)
+        {
+            int id = ++nextId;
+            string json = await RequestAsync(client, new HomeAssistantCommand { id = id, type = type }, id, ct);
+            return JsonUtility.FromJson<HomeAssistantRegistryResponse<T>>(json)?.result ?? Array.Empty<T>();
+        }
+
+        public void StartDemo()
+        {
+            Disconnect();
+            IsDemo = true;
+            LastError = "";
+            states.AddRange(HomeAssistantDevices.DemoStates());
+            Catalog.LoadDemo();
+            NotifyStates();
+            ConnectionStateChanged?.Invoke();
+        }
+
+        public bool IsPending(string entityId) => pendingEntities.Contains(entityId);
+
+        public bool TryGetCachedState(string entityId, out HomeAssistantStateSummary state)
+        {
+            state = states.Find(item => item.entity_id == entityId);
+            return state != null;
+        }
+
+        public Task<string> SetPowerAsync(string entityId, bool on)
+        {
+            return ControlAsync(entityId, id => new HomeAssistantServiceRequest
+            {
+                id = id, domain = entityId.Split('.')[0], service = on ? "turn_on" : "turn_off",
+                target = new HomeAssistantTarget { entity_id = entityId }
+            }, state => state.state == (on ? "on" : "off"), state => state.state = on ? "on" : "off");
+        }
+
+        public Task<string> SetLightAsync(string entityId, int? brightness, int? temperature)
+        {
+            if (!TryGetCachedState(entityId, out var state) || (!brightness.HasValue && !temperature.HasValue) ||
+                (brightness.HasValue && (!HomeAssistantDevices.SupportsBrightness(state) || brightness < 1 || brightness > 255)) ||
+                (temperature.HasValue && (!HomeAssistantDevices.SupportsTemperature(state) || temperature < state.attributes.min_color_temp_kelvin || temperature > state.attributes.max_color_temp_kelvin)))
+                return Task.FromResult("This light does not support those settings.");
+            var target = new HomeAssistantTarget { entity_id = entityId };
+            return ControlAsync(entityId, id => brightness.HasValue && temperature.HasValue
+                ? (object)new HomeAssistantLightRequest<LightData> { id = id, target = target, service_data = new LightData { brightness = brightness.Value, color_temp_kelvin = temperature.Value } }
+                : brightness.HasValue ? new HomeAssistantLightRequest<BrightnessData> { id = id, target = target, service_data = new BrightnessData { brightness = brightness.Value } }
+                : new HomeAssistantLightRequest<TemperatureData> { id = id, target = target, service_data = new TemperatureData { color_temp_kelvin = temperature.Value } },
+                updated => updated.state == "on" && (!brightness.HasValue || Math.Abs(updated.attributes.brightness - brightness.Value) <= 3) &&
+                    (!temperature.HasValue || (updated.attributes.color_mode == "color_temp" && Math.Abs(updated.attributes.color_temp_kelvin - temperature.Value) <= 100)),
+                updated => { updated.state = "on"; if (brightness.HasValue) updated.attributes.brightness = brightness.Value;
+                    if (temperature.HasValue) { updated.attributes.color_temp_kelvin = temperature.Value; updated.attributes.color_mode = "color_temp"; } });
+        }
+
+        private async Task<string> ControlAsync(string entityId, Func<int, object> payload, Predicate<HomeAssistantStateSummary> confirmed, Action<HomeAssistantStateSummary> simulate)
+        {
+            if (!TryGetCachedState(entityId, out var state) || !HomeAssistantDevices.CanControl(state)) return "This device cannot be controlled here.";
+            if ((!IsConnected && !IsDemo) || IsPending(entityId)) return "Device is not ready.";
+            var currentSession = session;
+            bool wasDemo = IsDemo;
+            var timer = Stopwatch.StartNew();
+            string outcome = "Not confirmed";
+            pendingEntities.Add(entityId);
+            StatesChanged?.Invoke(states);
+            try
+            {
+                if (wasDemo)
+                {
+                    await Task.Delay(250);
+                    if (!IsDemo || !states.Contains(state)) return "Demo ended.";
+                    simulate(state);
+                    state.last_updated = DateTime.UtcNow.ToString("O");
+                    StateUpdated?.Invoke(state);
+                    NotifyStates();
+                    outcome = "Demo confirmed";
+                    return "";
+                }
+                int id = ++nextId;
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(currentSession.Token);
+                timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                await RequestAsync(socket, payload(id), id, timeout.Token);
+                // A service result is acceptance, not proof that the physical state changed.
+                while (!timeout.IsCancellationRequested)
+                {
+                    if (session != currentSession || !IsConnected) return "Connection changed. Check the device before retrying.";
+                    if (TryGetCachedState(entityId, out var updated) && confirmed(updated)) { outcome = "State confirmed"; return ""; }
+                    await Task.Delay(100, timeout.Token);
+                }
+                return "No updated state received. Check the device before retrying.";
+            }
+            catch (OperationCanceledException) { return "No confirmed update. Check the connection and device before retrying."; }
+            catch (Exception) { return "Home Assistant could not complete the action. Check device availability and permissions."; }
+            finally
+            {
+                if ((wasDemo && IsDemo && states.Contains(state)) || (!wasDemo && session == currentSession))
+                {
+                    pendingEntities.Remove(entityId);
+                    LastActionStatus = outcome;
+                    LastActionMilliseconds = timer.ElapsedMilliseconds;
+                    StatesChanged?.Invoke(states);
+                }
+            }
+        }
+
+        private async Task<string> RequestAsync(ClientWebSocket client, object payload, int id, CancellationToken ct)
+        {
+            var completion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            requests.Add(id, completion);
+            using var registration = ct.Register(() => completion.TrySetCanceled());
+            try
+            {
+                await SendAsync(client, JsonUtility.ToJson(payload), ct);
+                string json = await completion.Task;
+                var result = JsonUtility.FromJson<HomeAssistantMessageEnvelope>(json);
+                if (result.type != "pong" && !result.success) throw new InvalidOperationException("Home Assistant rejected the request.");
+                return json;
+            }
+            finally { requests.Remove(id); }
+        }
+
+        private async Task ReceiveLoopAsync(ClientWebSocket client, CancellationTokenSource lifetime)
+        {
+            try
+            {
+                CancellationToken ct = lifetime.Token;
+                while (!ct.IsCancellationRequested)
+                {
+                    string json = await ReceiveAsync(client, ct);
+                    if (session != lifetime) return;
+                    LastContactUtc = DateTime.UtcNow;
+                    var envelope = JsonUtility.FromJson<HomeAssistantMessageEnvelope>(json);
+                    if ((envelope?.type == "result" || envelope?.type == "pong") && requests.TryGetValue(envelope.id, out var completion)) completion.TrySetResult(json);
+                    else if (envelope?.type == "event" && envelope.id == subscriptionId)
+                    {
+                        if (initializing) initialEvents.Add(json);
+                        else { ApplyEvent(json); NotifyStates(); }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                ConnectionLost(lifetime);
+            }
+        }
+
+        private void ApplyEvent(string json)
+        {
+            var data = JsonUtility.FromJson<HomeAssistantEventEnvelope>(json)?.@event?.data;
+            if (data == null || string.IsNullOrEmpty(data.entity_id)) return;
+            int index = states.FindIndex(item => item.entity_id == data.entity_id);
+            if (data.new_state == null) { if (index >= 0) states.RemoveAt(index); return; }
+            data.new_state.entity_id = data.entity_id;
+            if (index >= 0) states[index] = data.new_state;
+            else states.Add(data.new_state);
+            StateUpdated?.Invoke(data.new_state);
+        }
+
+        private async Task SendAsync(ClientWebSocket client, string json, CancellationToken ct)
+        {
+            await sendLock.WaitAsync(ct);
+            try { await client.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json)), WebSocketMessageType.Text, true, ct); }
+            finally { sendLock.Release(); }
+        }
+
+        private static async Task<string> ReceiveAsync(ClientWebSocket client, CancellationToken ct)
+        {
+            byte[] buffer = new byte[8192];
+            using var message = new MemoryStream();
+            WebSocketReceiveResult result;
+            do
+            {
+                result = await client.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
+                if (result.MessageType != WebSocketMessageType.Text) throw new WebSocketException();
+                message.Write(buffer, 0, result.Count);
+                if (message.Length > 16 * 1024 * 1024) throw new InvalidOperationException("Message too large.");
+            } while (!result.EndOfMessage);
+            // Decode after reassembly; a UTF-8 character may straddle WebSocket fragments.
+            return Encoding.UTF8.GetString(message.ToArray());
+        }
+
+        private void NotifyStates()
+        {
+            LastStateUpdate = DateTime.Now;
+            StatesChanged?.Invoke(states);
         }
     }
 }

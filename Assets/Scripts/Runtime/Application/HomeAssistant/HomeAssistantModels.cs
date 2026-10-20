@@ -66,7 +66,83 @@ namespace MRHomeAssistant.Runtime.Application.HomeAssistant
         public float step;
         public string duration = string.Empty;
         public string finishes_at = string.Empty;
+        public string[] supported_color_modes = Array.Empty<string>();
+        public string color_mode = string.Empty;
+        public int brightness;
+        public int color_temp_kelvin;
+        public int min_color_temp_kelvin;
+        public int max_color_temp_kelvin;
     }
+
+    [Serializable]
+    internal sealed class HomeAssistantServiceRequest
+    {
+        public int id;
+        public string type = "call_service";
+        public string domain;
+        public string service;
+        public HomeAssistantTarget target;
+    }
+
+    [Serializable]
+    internal sealed class HomeAssistantTarget
+    {
+        public string entity_id;
+    }
+
+    [Serializable]
+    internal sealed class HomeAssistantCommand
+    {
+        public int id;
+        public string type;
+    }
+
+    [Serializable]
+    internal sealed class HomeAssistantRegistryResponse<T>
+    {
+        public T[] result;
+    }
+
+    [Serializable]
+    public sealed class HomeAssistantArea
+    {
+        public string area_id;
+        public string name;
+    }
+
+    [Serializable]
+    public sealed class HomeAssistantDevice
+    {
+        public string id;
+        public string name;
+        public string name_by_user;
+        public string area_id;
+    }
+
+    [Serializable]
+    public sealed class HomeAssistantEntity
+    {
+        public string entity_id;
+        public string device_id;
+        public string area_id;
+        public string hidden_by;
+        public string disabled_by;
+    }
+
+    [Serializable]
+    internal sealed class HomeAssistantLightRequest<T>
+    {
+        public int id;
+        public string type = "call_service";
+        public string domain = "light";
+        public string service = "turn_on";
+        public HomeAssistantTarget target;
+        public T service_data;
+    }
+
+    [Serializable] internal sealed class BrightnessData { public int brightness; }
+    [Serializable] internal sealed class TemperatureData { public int color_temp_kelvin; }
+    [Serializable] internal sealed class LightData { public int brightness; public int color_temp_kelvin; }
 
     [Serializable]
     internal sealed class HomeAssistantSubscribeEventsRequest

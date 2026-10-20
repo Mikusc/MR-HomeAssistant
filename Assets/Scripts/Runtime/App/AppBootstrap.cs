@@ -148,20 +148,11 @@ namespace MRHomeAssistant.Runtime.App
 
             Debug.Log(
                 $"[AppBootstrap] App settings loaded | Path={appSettingsRepository.FilePath} | " +
-                $"Url={FormatUrl(loadedSettings.homeAssistantUrl)} | " +
-                $"Token={DescribeToken(loadedSettings.homeAssistantToken)} | " +
+                $"UrlSet={!string.IsNullOrWhiteSpace(loadedSettings.homeAssistantUrl)} | " +
+                $"TokenSet={!string.IsNullOrWhiteSpace(loadedSettings.homeAssistantToken)} | " +
                 $"OnboardingCompleted={loadedSettings.onboardingCompleted}",
                 this);
         }
 
-        private static string FormatUrl(string url)
-        {
-            return string.IsNullOrWhiteSpace(url) ? "<empty>" : url;
-        }
-
-        private static string DescribeToken(string token)
-        {
-            return string.IsNullOrWhiteSpace(token) ? "<empty>" : $"set ({token.Length} chars)";
-        }
     }
 }

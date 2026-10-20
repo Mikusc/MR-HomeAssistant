@@ -33,3 +33,12 @@ Thumbs.db
 *.apk
 *.aab
 TempAssembly.dll
+
+# Local credentials and per-device settings (never publish).
+.env
+.env.*
+!.env.example
+app-settings.json
+dashboard-preferences.json
+*.keystore
+*.jks
